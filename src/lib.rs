@@ -7,11 +7,76 @@ use std::thread;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
+use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget};
+use zip::ZipArchive;
+
+// finder
+pub fn password_finder(zip_path: &str, password_list_path: &str, workers: usize) -> Option<String> {
+    let zip_file_path = Path::new(zip_path);
+    let password_list_file_path = Path::new(password_list_path).to_path_buf();
+
+    let progress_bar = ProgressBar::new(0);
+    let progress_style = ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {wide_bar} {pos}/{len} throughput:{per_sec} (eta:{eta})")
+        .expect("Failed to create progress style");
+    progress_bar.set_style(progress_style);
+
+    let draw_target = ProgressDrawTarget::stdout_with_hz(2);
+    progress_bar.set_draw_target(draw_target);
+
+    let file = BufReader::new(File::open(password_list_file_path.clone()).expect("Unable to open file"));
+    let total_password_count = file.lines().count();
+    progress_bar.set_length(total_password_count as u64);
+
+    let (password_sender, password_receiver): (Sender<String>, Receiver<String>) =
+        crossbeam_channel::bounded(workers * 10_000);
+
+    let (found_password_sender, found_password_receiver): (Sender<String>, Receiver<String>) =
+        crossbeam_channel::bounded(1);
+
+    let stop_workers_signal = Arc::new(AtomicBool::new(false));
+    let stop_gen_signal = Arc::new(AtomicBool::new(false));
+
+    let password_gen_handle = start_password_reader(
+        password_list_file_path,
+        password_sender,
+        stop_gen_signal.clone(),
+    );
+
+    let mut worker_handles = Vec::with_capacity(workers);
+    for i in 1..=workers {
+        let join_handle = password_checker(
+            i,
+            zip_file_path,
+            password_receiver.clone(),
+            stop_workers_signal.clone(),
+            found_password_sender.clone(),
+            progress_bar.clone()
+        );
+        worker_handles.push(join_handle);
+    }
+
+    drop(found_password_sender);
+
+    match found_password_receiver.recv() {
+        Ok(password_found) => {
+            stop_gen_signal.store(true, Ordering::Relaxed);
+            password_gen_handle.join().unwrap();
+            stop_workers_signal.store(true, Ordering::Relaxed);
+            for handle in worker_handles {
+                handle.join().unwrap();
+            }
+            progress_bar.finish_and_clear();
+            Some(password_found)
+        }
+        Err(_) => None,
+    }
+}
 
 // reader
-pub fn start_password_reader(
+fn start_password_reader(
     file_path: PathBuf,
-    send_password: Sender<String>,
+    password_sender: Sender<String>,
     stop_signal: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -23,9 +88,9 @@ pub fn start_password_reader(
                 if stop_signal.load(Ordering::Relaxed) {
                     break;
                 } else {
-                    match send_password.send(line.unwrap()) {
+                    match password_sender.send(line.unwrap()) {
                         Ok(_) => {}
-                        Err(_) => break, // channel disconnected, stop thread
+                        Err(_) => break,
                     }
                 }
             }
@@ -34,91 +99,44 @@ pub fn start_password_reader(
 }
 
 // worker
-pub fn password_checker(
+fn password_checker(
     index: usize,
     file_path: &Path,
-    receive_password: Receiver<String>,
+    password_receiver: Receiver<String>,
     stop_signal: Arc<AtomicBool>,
-    send_password_found: Sender<String>,
+    found_password_sender: Sender<String>,
+    progress_bar: ProgressBar,
 ) -> JoinHandle<()> {
     let file = File::open(file_path).expect("File should exist");
     thread::Builder::new()
         .name(format!("worker-{}", index))
         .spawn(move || {
-            let mut archive = zip::ZipArchive::new(file).expect("Archive validated before-hand");
+            let mut archive = ZipArchive::new(file).expect("Archive validated before-hand");
             while !stop_signal.load(Ordering::Relaxed) {
-                match receive_password.recv() {
-                    Err(_) => break, // channel disconnected, stop thread
+                match password_receiver.recv() {
+                    Err(_) => break,
                     Ok(password) => {
-                        let res = archive.by_index_decrypt(0, password.as_bytes()); // decrypt first file in archive
+                        let res = archive.by_index_decrypt(0, password.as_bytes());
                         match res {
                             Err(e) => panic!("Unexpected error {:?}", e),
-                            Ok(Err(_)) => (), // invalid password - continue
+                            Ok(Err(_)) => (), // invalid password
                             Ok(Ok(mut zip)) => {
-                                // Validate password by reading the zip file to make sure it is not merely a hash collision.
+                                // ハッシュの衝突ではないことを検証する
                                 let mut buffer = Vec::with_capacity(zip.size() as usize);
                                 match zip.read_to_end(&mut buffer) {
-                                    Err(_) => (), // password collision - continue
+                                    Err(_) => (), // password collision
                                     Ok(_) => {
-                                        // Send password and continue processing while waiting for signal
-                                        send_password_found
+                                        found_password_sender
                                             .send(password)
                                             .expect("Send found password should not fail");
                                     }
                                 }
                             }
                         }
+                        progress_bar.inc(1);
                     }
                 }
             }
         })
         .unwrap()
-}
-
-// finder
-pub fn password_finder(zip_path: &str, password_list_path: &str, workers: usize) -> Option<String> {
-    let zip_file_path = Path::new(zip_path);
-    let password_list_file_path = Path::new(password_list_path).to_path_buf();
-
-    let (send_password, receive_password): (Sender<String>, Receiver<String>) =
-        crossbeam_channel::bounded(workers * 10_000);
-
-    let (send_found_password, receive_found_password): (Sender<String>, Receiver<String>) =
-        crossbeam_channel::bounded(1);
-
-    let stop_workers_signal = Arc::new(AtomicBool::new(false));
-    let stop_gen_signal = Arc::new(AtomicBool::new(false));
-
-    let password_gen_handle = start_password_reader(
-        password_list_file_path,
-        send_password,
-        stop_gen_signal.clone(),
-    );
-
-    let mut worker_handles = Vec::with_capacity(workers);
-    for i in 1..=workers {
-        let join_handle = password_checker(
-            i,
-            zip_file_path,
-            receive_password.clone(),
-            stop_workers_signal.clone(),
-            send_found_password.clone(),
-        );
-        worker_handles.push(join_handle);
-    }
-
-    drop(send_found_password);
-
-    match receive_found_password.recv() {
-        Ok(password_found) => {
-            stop_gen_signal.store(true, Ordering::Relaxed);
-            password_gen_handle.join().unwrap();
-            stop_workers_signal.store(true, Ordering::Relaxed);
-            for handle in worker_handles {
-                handle.join().unwrap();
-            }
-            Some(password_found)
-        }
-        Err(_) => None,
-    }
 }
