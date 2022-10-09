@@ -33,3 +33,4 @@ B --> 4
 
 - [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam)
 - [zip-rs](https://github.com/zip-rs/zip)
+- [indicatif](https://github.com/console-rs/indicatif)
