@@ -2,7 +2,7 @@
 
 <samp>
 
-# zip-password-finder
+# zip-pw-finder
 
 **A password finder for protected ZIP files using a brute force strategy**
 
@@ -22,7 +22,7 @@ B([Channel])
 3[Worker thread]
 4[Worker thread]
 
-A -->|submits| B
+A -->|push| B
 B --> 1
 B --> 2
 B --> 3
