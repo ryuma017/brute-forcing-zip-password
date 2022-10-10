@@ -32,5 +32,6 @@ B --> 4
 ## Dependencies
 
 - [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam)
-- [zip-rs](https://github.com/zip-rs/zip)
 - [indicatif](https://github.com/console-rs/indicatif)
+- [num_cpus](https://github.com/seanmonstar/num_cpus)
+- [zip-rs](https://github.com/zip-rs/zip)
